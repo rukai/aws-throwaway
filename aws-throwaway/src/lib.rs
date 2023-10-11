@@ -22,7 +22,7 @@ use uuid::Uuid;
 
 pub use aws_sdk_ec2::types::InstanceType;
 pub use ec2_instance::Ec2Instance;
-pub use ec2_instance_definition::Ec2InstanceDefinition;
+pub use ec2_instance_definition::{Ec2InstanceDefinition, InstanceOs};
 pub use tags::CleanupResources;
 
 const AZ: &str = "us-east-1c";
@@ -342,11 +342,15 @@ impl Aws {
             None
         };
 
+        let ubuntu_version = match definition.os {
+            InstanceOs::Ubuntu20_04 => "20.04",
+            InstanceOs::Ubuntu22_04 => "22.04",
+        };
         let image_id = format!(
-            "resolve:ssm:/aws/service/canonical/ubuntu/server/22.04/stable/current/{}/hvm/ebs-gp2/ami-id",
+            "resolve:ssm:/aws/service/canonical/ubuntu/server/{}/stable/current/{}/hvm/ebs-gp2/ami-id",
+            ubuntu_version,
             cpu_arch::get_arch_of_instance_type(definition.instance_type.clone()).get_ubuntu_arch_identifier()
         );
-
         let result = self
             .client
             .run_instances()
