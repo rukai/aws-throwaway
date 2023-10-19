@@ -41,7 +41,7 @@ pub struct Aws {
     host_private_key: String,
     security_group_id: String,
     placement_group_name: String,
-    default_subnet_id: String,
+    subnet_id: String,
     tags: Tags,
 }
 
@@ -50,7 +50,24 @@ impl Aws {
     ///
     /// Before returning the [`Aws`], all preexisting resources conforming to the specified [`CleanupResources`] approach are destroyed.
     /// The specified [`CleanupResources`] is then also used by the [`Aws::cleanup_resources`] method.
-    pub async fn new(cleanup: CleanupResources) -> Self {
+    ///
+    /// All resources will be created in us-east-1c.
+    /// This is hardcoded so that aws-throawaway only has to look into one region when cleaning up.
+    /// All instances are created in a single spread placement group in a single AZ to ensure consistent latency between instances.
+    ///
+    /// If vpc_id is:
+    /// * Some(_) => all resources will go into that vpc
+    /// * None => all resources will go into the default vpc
+    /// If subnet_id is:
+    /// * Some(_) => all instances will go into that subnet
+    /// * None => all instances will go into the default subnet for the specified or default vpc
+    pub async fn new(
+        cleanup: CleanupResources,
+        // TODO: make these into a builder
+        vpc_id: Option<String>,
+        subnet_id: Option<String>,
+        security_group_id: Option<String>,
+    ) -> Self {
         let config = config().await;
         let user_name = iam::user_name(&config).await;
         let keyname = format!("aws-throwaway-{user_name}-{}", Uuid::new_v4());
@@ -68,9 +85,15 @@ impl Aws {
 
         let (client_private_key, security_group_id, _, default_subnet_id) = tokio::join!(
             Aws::create_key_pair(&client, &tags, &keyname),
-            Aws::create_security_group(&client, &tags, &security_group_name),
+            Aws::create_security_group(
+                &client,
+                &tags,
+                &security_group_name,
+                &vpc_id,
+                security_group_id
+            ),
             Aws::create_placement_group(&client, &tags, &placement_group_name),
-            Aws::get_default_subnet_id(&client)
+            Aws::get_default_subnet_id(&client, subnet_id)
         );
 
         let key = PrivateKey::random(&mut OsRng {}, ssh_key::Algorithm::Ed25519).unwrap();
@@ -87,7 +110,7 @@ impl Aws {
             host_private_key,
             security_group_id,
             placement_group_name,
-            default_subnet_id,
+            subnet_id: default_subnet_id,
             tags,
         }
     }
@@ -111,26 +134,35 @@ impl Aws {
         client: &aws_sdk_ec2::Client,
         tags: &Tags,
         name: &str,
+        vpc_id: &Option<String>,
+        security_group_id: Option<String>,
     ) -> String {
-        let security_group_id = client
-            .create_security_group()
-            .group_name(name)
-            .description("aws-throwaway security group")
-            .tag_specifications(tags.create_tags(ResourceType::SecurityGroup, "aws-throwaway"))
-            .send()
-            .await
-            .map_err(|e| e.into_service_error())
-            .unwrap()
-            .group_id
-            .unwrap();
-        tracing::info!("created security group");
+        match security_group_id {
+            Some(id) => id,
+            None => {
+                let security_group_id = client
+                    .create_security_group()
+                    .group_name(name)
+                    .set_vpc_id(vpc_id.clone())
+                    .description("aws-throwaway security group")
+                    .tag_specifications(
+                        tags.create_tags(ResourceType::SecurityGroup, "aws-throwaway"),
+                    )
+                    .send()
+                    .await
+                    .map_err(|e| e.into_service_error())
+                    .unwrap()
+                    .group_id
+                    .unwrap();
+                tracing::info!("created security group");
 
-        tokio::join!(
-            Aws::create_ingress_rule_internal(client, tags, name),
-            Aws::create_ingress_rule_ssh(client, tags, name),
-        );
-
-        security_group_id
+                tokio::join!(
+                    Aws::create_ingress_rule_internal(client, tags, name),
+                    Aws::create_ingress_rule_ssh(client, tags, name),
+                );
+                security_group_id
+            }
+        }
     }
 
     async fn create_ingress_rule_internal(
@@ -187,31 +219,37 @@ impl Aws {
         tracing::info!("created placement group");
     }
 
-    async fn get_default_subnet_id(client: &aws_sdk_ec2::Client) -> String {
-        client
-            .describe_subnets()
-            .filters(
-                Filter::builder()
-                    .name("default-for-az")
-                    .values("true")
-                    .build(),
-            )
-            .filters(
-                Filter::builder()
-                    .name("availability-zone")
-                    .values(AZ)
-                    .build(),
-            )
-            .send()
-            .await
-            .map_err(|e| e.into_service_error())
-            .unwrap()
-            .subnets
-            .unwrap()
-            .pop()
-            .unwrap()
-            .subnet_id
-            .unwrap()
+    async fn get_default_subnet_id(
+        client: &aws_sdk_ec2::Client,
+        subnet_id: Option<String>,
+    ) -> String {
+        match subnet_id {
+            Some(subnet_id) => subnet_id,
+            None => client
+                .describe_subnets()
+                .filters(
+                    Filter::builder()
+                        .name("default-for-az")
+                        .values("true")
+                        .build(),
+                )
+                .filters(
+                    Filter::builder()
+                        .name("availability-zone")
+                        .values(AZ)
+                        .build(),
+                )
+                .send()
+                .await
+                .map_err(|e| e.into_service_error())
+                .unwrap()
+                .subnets
+                .unwrap()
+                .pop()
+                .unwrap()
+                .subnet_id
+                .unwrap(),
+        }
     }
 
     /// Call before dropping [`Aws`]
@@ -315,7 +353,7 @@ impl Aws {
                     err.into_service_error().meta().message()
                 )
             } else {
-                tracing::info!("security group {id:?} was succesfully deleted",)
+                tracing::info!("security group {id:?} was succesfully deleted")
             }
         }
     }
@@ -353,7 +391,7 @@ impl Aws {
 
     async fn delete_keypairs(client: &aws_sdk_ec2::Client, tags: &Tags) {
         for id in Self::get_all_throwaway_tags(client, tags, "key-pair").await {
-            client
+            if let Err(err) = client
                 .delete_key_pair()
                 .key_pair_id(&id)
                 .send()
@@ -362,8 +400,11 @@ impl Aws {
                     anyhow::anyhow!(e.into_service_error())
                         .context(format!("Failed to delete keypair {id:?}"))
                 })
-                .unwrap();
-            tracing::info!("keypair {id:?} was succesfully deleted");
+            {
+                tracing::error!("keypair {id:?} could not be deleted: {err}");
+            } else {
+                tracing::info!("keypair {id:?} was succesfully deleted");
+            }
         }
     }
 
@@ -398,11 +439,11 @@ impl Aws {
             InstanceOs::Ubuntu20_04 => "20.04",
             InstanceOs::Ubuntu22_04 => "22.04",
         };
-        let image_id = format!(
+        let image_id = definition.ami.unwrap_or_else(|| format!(
             "resolve:ssm:/aws/service/canonical/ubuntu/server/{}/stable/current/{}/hvm/ebs-gp2/ami-id",
             ubuntu_version,
             cpu_arch::get_arch_of_instance_type(definition.instance_type.clone()).get_ubuntu_arch_identifier()
-        );
+        ));
         let result = self
             .client
             .run_instances()
@@ -413,6 +454,11 @@ impl Aws {
                     .availability_zone(AZ)
                     .build(),
             ))
+            .set_subnet_id(if elastic_ip.is_some() {
+                None
+            } else {
+                Some(self.subnet_id.to_owned())
+            })
             .min_count(1)
             .max_count(1)
             .block_device_mappings(
@@ -437,7 +483,7 @@ impl Aws {
                                 .device_index(i as i32)
                                 .groups(&self.security_group_id)
                                 .associate_public_ip_address(false)
-                                .subnet_id(&self.default_subnet_id)
+                                .subnet_id(&self.subnet_id)
                                 .description(i.to_string())
                                 .build()
                         })
