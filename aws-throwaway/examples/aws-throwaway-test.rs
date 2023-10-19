@@ -10,7 +10,7 @@ async fn main() {
         .with_writer(non_blocking)
         .init();
 
-    let aws = Aws::new(CleanupResources::AllResources).await;
+    let aws = Aws::new(CleanupResources::AllResources, None, None).await;
     let instance = aws
         .create_ec2_instance(Ec2InstanceDefinition::new(InstanceType::T2Micro))
         .await;
