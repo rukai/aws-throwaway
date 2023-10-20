@@ -15,7 +15,6 @@ use aws_sdk_ec2::types::{
 use base64::Engine;
 use ssh_key::rand_core::OsRng;
 use ssh_key::PrivateKey;
-use std::time::{Duration, Instant};
 use tags::Tags;
 use uuid::Uuid;
 
@@ -301,21 +300,6 @@ impl Aws {
     }
 
     async fn cleanup_resources_inner(client: &aws_sdk_ec2::Client, tags: &Tags) {
-        // release elastic ips
-        for id in Self::get_all_throwaway_tags(client, tags, "elastic-ip").await {
-            client
-                .release_address()
-                .allocation_id(&id)
-                .send()
-                .await
-                .map_err(|e| {
-                    anyhow::anyhow!(e.into_service_error())
-                        .context(format!("Failed to release elastic ip {id:?}"))
-                })
-                .unwrap();
-            tracing::info!("elastic ip {id:?} was succesfully deleted");
-        }
-
         tracing::info!("Terminating instances");
         let instance_ids = Self::get_all_throwaway_tags(client, tags, "instance").await;
         if !instance_ids.is_empty() {
@@ -412,18 +396,7 @@ impl Aws {
     pub async fn create_ec2_instance(&self, definition: Ec2InstanceDefinition) -> Ec2Instance {
         // elastic IP's are a limited resource so only create it if we truly need it.
         let elastic_ip = if definition.network_interface_count > 1 {
-            Some(
-                self.client
-                    .allocate_address()
-                    .tag_specifications(
-                        self.tags
-                            .create_tags(ResourceType::ElasticIp, "aws-throwaway"),
-                    )
-                    .send()
-                    .await
-                    .map_err(|e| e.into_service_error())
-                    .unwrap(),
-            )
+            Some(())
         } else {
             None
         };
@@ -515,16 +488,6 @@ sudo systemctl start ssh
             .unwrap();
 
         let instance = result.instances().unwrap().first().unwrap();
-        let primary_network_interface_id = instance
-            .network_interfaces
-            .as_ref()
-            .unwrap()
-            .iter()
-            .find(|x| x.attachment.as_ref().unwrap().device_index.unwrap() == 0)
-            .unwrap()
-            .network_interface_id
-            .as_ref()
-            .unwrap();
 
         let network_interfaces = instance
             .network_interfaces
@@ -537,40 +500,9 @@ sudo systemctl start ssh
             })
             .collect();
 
-        if let Some(elastic_ip) = &elastic_ip {
-            let start = Instant::now();
-            loop {
-                match self
-                    .client
-                    .associate_address()
-                    .allocation_id(elastic_ip.allocation_id.as_ref().unwrap())
-                    .network_interface_id(primary_network_interface_id)
-                    .send()
-                    .await
-                {
-                    Ok(_) => {
-                        break;
-                    }
-                    Err(err) => {
-                        // It is expected to receive the following error if we attempt too early:
-                        // `The pending-instance-running instance to which 'eni-***' is attached is not in a valid state for this operation`
-                        if start.elapsed() > Duration::from_secs(120) {
-                            panic!(
-                                "Received error while assosciating address after 120s retrying: {}",
-                                err.into_service_error()
-                            );
-                        } else {
-                            tokio::time::sleep(Duration::from_secs(2)).await;
-                        }
-                    }
-                }
-            }
-        }
-
-        let mut public_ip = elastic_ip.map(|x| x.public_ip.unwrap().parse().unwrap());
         let mut private_ip = None;
 
-        while public_ip.is_none() || private_ip.is_none() {
+        while private_ip.is_none() {
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             for reservation in self
                 .client
@@ -584,19 +516,15 @@ sudo systemctl start ssh
                 .unwrap()
             {
                 for instance in reservation.instances().unwrap() {
-                    if public_ip.is_none() {
-                        public_ip = instance.public_ip_address().map(|x| x.parse().unwrap());
-                    }
                     private_ip = instance.private_ip_address().map(|x| x.parse().unwrap());
                 }
             }
         }
-        let public_ip = public_ip.unwrap();
         let private_ip = private_ip.unwrap();
-        tracing::info!("created EC2 instance at: {public_ip}");
+        tracing::info!("created EC2 instance at: {private_ip}");
 
         Ec2Instance::new(
-            public_ip,
+            private_ip,
             private_ip,
             self.host_public_key_bytes.clone(),
             self.host_public_key.clone(),
