@@ -12,8 +12,12 @@ use tokio::{
     net::TcpStream,
 };
 
+use crate::rsync;
+
 pub struct SshConnection {
-    address: IpAddr,
+    pub(crate) client_private_key: String,
+    pub(crate) host_public_key: String,
+    pub(crate) address: IpAddr,
     session: Handle<Client>,
 }
 
@@ -22,6 +26,7 @@ impl SshConnection {
         stream: TcpStream,
         address: IpAddr,
         host_public_key_bytes: Vec<u8>,
+        host_public_key: String,
         client_private_key: &str,
     ) -> Result<Self> {
         let config = Arc::new(Config::default());
@@ -40,7 +45,12 @@ impl SshConnection {
         .await?;
         if session.authenticate_publickey("ubuntu", key).await.unwrap() {
             tracing::info!("Succesfully connected to {address} over ssh");
-            Ok(SshConnection { session, address })
+            Ok(SshConnection {
+                session,
+                address,
+                client_private_key: client_private_key.to_owned(),
+                host_public_key,
+            })
         } else {
             Err(anyhow!("Authentication with ssh server failed"))
         }
@@ -96,6 +106,11 @@ impl SshConnection {
 
         check_results(&format!("The command {command}"), failed, status, &output);
         output
+    }
+
+    /// Only needed for shelling out to rsync
+    pub(crate) fn openssh_known_hosts_line(&self) -> String {
+        format!("{} {}", &self.address, &self.host_public_key)
     }
 
     /// Runs a shell command reporting its logs over stdout while it executes.
@@ -188,6 +203,9 @@ impl SshConnection {
     }
 
     /// Push a file from the local machine to the remote machine
+    ///
+    /// This is significantly slower than `push_rsync` but avoids the rsync dependency.
+    /// Prefer `pull_rsync` if possible.
     pub async fn push_file(&self, source: &Path, dest: &Path) {
         let task = format!("pushing file from {source:?} to {}:{dest:?}", self.address);
         tracing::info!("{task}");
@@ -200,6 +218,9 @@ impl SshConnection {
     }
 
     /// Create a file on the remote machine at `dest` with the provided bytes.
+    ///
+    /// This is significantly slower than `push_rsync` but avoids the rsync dependency.
+    /// Prefer `pull_rsync` if possible.
     pub async fn push_file_from_bytes(&self, bytes: &[u8], dest: &Path) {
         let task = format!("pushing raw bytes to {}:{dest:?}", self.address);
         tracing::info!("{task}");
@@ -255,6 +276,9 @@ impl SshConnection {
     }
 
     /// Pull a file from the remote machine to the local machine
+    ///
+    /// This is significantly slower than `pull_rsync` but avoids the rsync dependency.
+    /// Prefer `pull_rsync` if possible.
     pub async fn pull_file(&self, source: &Path, dest: &Path) {
         let task = format!("pulling file from {}:{source:?} to {dest:?}", self.address);
         tracing::info!("{task}");
@@ -300,6 +324,38 @@ impl SshConnection {
 
         let output = String::from_utf8(stderr).unwrap();
         check_results(&task, failed, status, &output);
+    }
+
+    /// Pulls a file or directory from `source` on the remote machine to `dest` on your local machine.
+    ///
+    /// Currently you must have the rsync command installed on your system to call this function.
+    /// In the future this may rely on a statically linked rsync implementation instead of shelling out.
+    pub async fn pull_rsync(&self, source: &str, dest: &Path) {
+        let address = &self.address;
+        rsync::rsync(
+            self,
+            vec![
+                format!("ubuntu@{address}:/home/ubuntu/{source}"),
+                dest.to_str().unwrap().to_owned(),
+            ],
+        )
+        .await
+    }
+
+    /// Pulls a file or directory from `source` on the remote machine to `dest` on your local machine.
+    ///
+    /// Currently you must have the rsync command installed on your system to call this function.
+    /// In the future this may rely on a statically linked rsync implementation instead of shelling out.
+    pub async fn push_rsync(&self, source: &Path, dest: &str) {
+        let address = &self.address;
+        rsync::rsync(
+            self,
+            vec![
+                source.to_str().unwrap().to_owned(),
+                format!("ubuntu@{address}:/home/ubuntu/{dest}"),
+            ],
+        )
+        .await
     }
 }
 

@@ -110,6 +110,7 @@ TERM=xterm ssh -i key ubuntu@{} -o "UserKnownHostsFile known_hosts"
                         stream,
                         connect_ip,
                         host_public_key_bytes.clone(),
+                        host_public_key.clone(),
                         client_private_key,
                     )
                     .await

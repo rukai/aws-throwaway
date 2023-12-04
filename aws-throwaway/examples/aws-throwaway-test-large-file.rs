@@ -1,4 +1,4 @@
-use aws_throwaway::{Aws, CleanupResources, Ec2InstanceDefinition, InstanceType};
+use aws_throwaway::{Aws, CleanupResources, Ec2Instance, Ec2InstanceDefinition, InstanceType};
 use std::{path::Path, time::Instant};
 use tracing_subscriber::EnvFilter;
 
@@ -26,8 +26,38 @@ async fn main() {
         .ssh()
         .push_file(Path::new("some_local_file"), Path::new("some_remote_file"))
         .await;
-    println!("Time to push 100MB file {:?}", start.elapsed());
+    println!("Time to push 100MB file via ssh {:?}", start.elapsed());
+    assert_remote_size(&instance).await;
 
+    let start = Instant::now();
+    instance
+        .ssh()
+        .push_rsync(Path::new("some_local_file"), "some_remote_file")
+        .await;
+    println!("Time to push 100MB file via rsync {:?}", start.elapsed());
+    assert_remote_size(&instance).await;
+
+    let start = Instant::now();
+    instance
+        .ssh()
+        .pull_file(Path::new("some_remote_file"), Path::new("some_local_file"))
+        .await;
+    println!("Time to pull 100MB file via ssh {:?}", start.elapsed());
+    assert_local_size();
+
+    let start = Instant::now();
+    instance
+        .ssh()
+        .pull_rsync("some_remote_file", Path::new("some_local_file"))
+        .await;
+    println!("Time to pull 100MB file via rsync {:?}", start.elapsed());
+    assert_local_size();
+
+    aws.cleanup_resources().await;
+    println!("\nAll AWS throwaway resources have been deleted")
+}
+
+async fn assert_remote_size(instance: &Ec2Instance) {
     let remote_size: usize = instance
         .ssh()
         .shell("wc -c some_remote_file")
@@ -39,17 +69,9 @@ async fn main() {
         .parse()
         .unwrap();
     assert_eq!(remote_size, FILE_LEN);
+}
 
-    let start = Instant::now();
-    instance
-        .ssh()
-        .pull_file(Path::new("some_remote_file"), Path::new("some_local_file"))
-        .await;
-    println!("Time to pull 100MB file {:?}", start.elapsed());
-
+fn assert_local_size() {
     assert_eq!(std::fs::read("some_local_file").unwrap().len(), FILE_LEN);
     std::fs::remove_file("some_local_file").unwrap();
-
-    aws.cleanup_resources().await;
-    println!("\nAll AWS throwaway resources have been deleted")
 }

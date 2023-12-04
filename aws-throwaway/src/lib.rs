@@ -2,6 +2,7 @@ mod cpu_arch;
 mod ec2_instance;
 mod ec2_instance_definition;
 mod iam;
+mod rsync;
 mod ssh;
 mod tags;
 
