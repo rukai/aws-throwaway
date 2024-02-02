@@ -226,7 +226,8 @@ impl Aws {
                 let result: SecurityGroup = run_command(&command).await.unwrap();
                 tracing::info!("created security group");
 
-                let mut futures = FuturesUnordered::<Pin<Box<dyn Future<Output = ()>>>>::new();
+                let mut futures =
+                    FuturesUnordered::<Pin<Box<dyn Future<Output = ()> + Send>>>::new();
                 futures.push(Box::pin(Aws::create_ingress_rule_internal(tags, name)));
                 if !ports.contains(&22) {
                     // SSH
@@ -576,7 +577,7 @@ impl Aws {
             "AvailabilityZone={AZ},GroupName={}",
             self.placement_group_name
         );
-        let user_data = base64::engine::general_purpose::STANDARD.encode(format!(
+        let user_data = format!(
             r#"#!/bin/bash
 sudo systemctl stop ssh
 echo "{}" > /etc/ssh/ssh_host_ed25519_key.pub
@@ -586,7 +587,10 @@ echo "ClientAliveInterval 30" >> /etc/ssh/sshd_config
 sudo systemctl start ssh
 "#,
             self.host_public_key, self.host_private_key
-        ));
+        );
+        tracing::info!("{user_data}");
+        let user_data = base64::engine::general_purpose::STANDARD.encode(user_data);
+        tracing::info!("{user_data}");
         let block_device_mappings = format!(
             "DeviceName=/dev/sda1,Ebs={{DeleteOnTermination=true,VolumeSize={},VolumeType=gp2}}",
             definition.volume_size_gb
@@ -612,7 +616,7 @@ sudo systemctl start ssh
             "--block-device-mappings",
             &block_device_mappings,
         ];
-        let value;
+        let mut value = vec![];
         if definition.network_interface_count == 1 {
             command.push("--subnet-id");
             command.push(&self.subnet_id);
@@ -621,18 +625,18 @@ sudo systemctl start ssh
             command.push("--security-group-ids");
             command.push(&self.security_group_id);
         } else {
-            command.push("--networking-interfaces");
-            value = (0..definition.network_interface_count)
-                .map(|i| {
-                    format!(
-                        "DeleteOnTermination=true,AssociatePublicIpAddress=false,DeviceIndex={i},Groups={},SubnetId={},Description={i}",
-                        &self.security_group_id,
-                        &self.subnet_id
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join(",");
-            command.push(&value);
+            command.push("--network-interfaces");
+            for i in 0..definition.network_interface_count {
+                value.push(format!(
+                    "DeleteOnTermination=true,AssociatePublicIpAddress=false,DeviceIndex={i},Groups={},SubnetId={},Description={i}",
+                    &self.security_group_id,
+                    &self.subnet_id
+                ));
+            }
+            // lifetimes workaround
+            for value in &value {
+                command.push(value)
+            }
         }
 
         let result: RunInstancesResponse = run_command(&command).await.unwrap();
@@ -750,8 +754,24 @@ sudo systemctl start ssh
 }
 
 async fn user_name() -> String {
-    let GetUser::User { user_name } = run_command(&["iam", "get-user"]).await.unwrap();
-    user_name
+    match iam_user_name().await {
+        Ok(name) => name,
+        Err(err) => {
+            tracing::debug!("Failed to run iam get-user, falling back to STS, error was: {err:?}");
+            sts_user_id().await
+        }
+    }
+}
+
+async fn iam_user_name() -> Result<String> {
+    let IamGetUser::User { user_name } = run_command(&["iam", "get-user"]).await?;
+    Ok(user_name)
+}
+
+async fn sts_user_id() -> String {
+    let StsGetCallerIdentity { user_id } =
+        run_command(&["sts", "get-caller-identity"]).await.unwrap();
+    user_id
 }
 
 async fn run_command_empty_response(args: &[&str]) -> Result<()> {
@@ -790,9 +810,15 @@ async fn run_command_string(args: &[&str]) -> Result<String> {
 }
 
 #[derive(serde::Deserialize)]
-enum GetUser {
+enum IamGetUser {
     User {
         #[serde(alias = "UserName")]
         user_name: String,
     },
+}
+
+#[derive(serde::Deserialize)]
+struct StsGetCallerIdentity {
+    #[serde(alias = "UserId")]
+    user_id: String,
 }
