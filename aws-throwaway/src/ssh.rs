@@ -183,6 +183,7 @@ impl SshConnection {
                         }
                     },
                     _ = tx.closed() => {
+                        channel.close().await.unwrap();
                         return;
                     },
                 };
